@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+@keyframes kenburns-slow {
+  0% {
+    transform: scale(1) translate(0, 0);
+  }
+  50% {
+    transform: scale(1.06) translate(-1%, -0.5%);
+  }
+  100% {
+    transform: scale(1) translate(0, 0);
+  }
+}
+
+.animate-kenburns {
+  animation: kenburns-slow 22s ease-in-out infinite alternate;
+}

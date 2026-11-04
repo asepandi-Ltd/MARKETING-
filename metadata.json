@@ -1,0 +1,6 @@
+{
+  "name": "AL-MULK MARKET INTELLIGENCE - Marketing Rujukan",
+  "description": "Modul Analisis & Strategi Marketing Rujukan RSUD Al-Mulk Kota Sukabumi berdasarkan data kunjungan rujukan, pemetaan perujuk, wilayah, poli, diagnosis, dan cara pembayaran.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

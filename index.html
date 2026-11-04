@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AL-MULK MARKET INTELLIGENCE - Marketing Rujukan</title>
+    <meta name="description" content="Modul Analisis & Strategi Marketing Rujukan RSUD Al-Mulk Kota Sukabumi berdasarkan data kunjungan rujukan, pemetaan perujuk, wilayah, poli, diagnosis, dan cara pembayaran." />
+    <meta property="og:title" content="AL-MULK MARKET INTELLIGENCE - Marketing Rujukan" />
+    <meta property="og:description" content="Modul Analisis & Strategi Marketing Rujukan RSUD Al-Mulk Kota Sukabumi berdasarkan data kunjungan rujukan, pemetaan perujuk, wilayah, poli, diagnosis, dan cara pembayaran." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <script>
+      (function() {
+        // 1. Intercept Vite HMR WebSocket connection to prevent connection failure in Cloud Run
+        var OriginalWebSocket = window.WebSocket;
+        if (OriginalWebSocket) {
+          window.WebSocket = function(url, protocols) {
+            if (typeof protocols === 'string' && protocols.includes('vite-hmr')) {
+              var dummy = {
+                addEventListener: function() {},
+                removeEventListener: function() {},
+                send: function() {},
+                close: function() {},
+                readyState: 3
+              };
+              return dummy;
+            }
+            return new OriginalWebSocket(url, protocols);
+          };
+          window.WebSocket.prototype = OriginalWebSocket.prototype;
+          window.WebSocket.CONNECTING = 0;
+          window.WebSocket.OPEN = 1;
+          window.WebSocket.CLOSING = 2;
+          window.WebSocket.CLOSED = 3;
+        }
+
+        // 2. Filter console.error from logging [vite] websocket connection failures
+        var origConsoleError = console.error;
+        console.error = function() {
+          var args = Array.prototype.slice.call(arguments);
+          var text = args.map(function(item) { return String(item); }).join(' ');
+          if (text.indexOf('failed to connect to websocket') !== -1 || text.indexOf('WebSocket closed without opened') !== -1) {
+            return;
+          }
+          origConsoleError.apply(console, args);
+        };
+
+        // 3. Prevent unhandled rejections / window errors
+        window.addEventListener('error', function(e) {
+          if (e && (e.message?.includes('WebSocket') || e.filename?.includes('@vite/client'))) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            return true;
+          }
+        }, true);
+        window.addEventListener('unhandledrejection', function(e) {
+          var reason = e && e.reason;
+          var msg = typeof reason === 'string' ? reason : (reason && reason.message) || '';
+          if (msg.includes('WebSocket') || msg.includes('vite')) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+          }
+        }, true);
+      })();
+    </script>
+  </head>
+  <body class="bg-slate-900 text-slate-100 antialiased font-['Plus_Jakarta_Sans',sans-serif]">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
