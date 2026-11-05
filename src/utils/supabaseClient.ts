@@ -16,6 +16,9 @@ export function cleanSupabaseKey(rawKey: string): string {
   return rawKey.trim().replace(/^['"]|['"]$/g, '');
 }
 
+export const DEFAULT_SUPABASE_URL = 'https://dariqcmfjnoopecliyar.supabase.co';
+export const DEFAULT_SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRhcmlxY21mam5vb3BlY2xpeWFyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMxMzcwNzIsImV4cCI6MjEwODcxMzA3Mn0.Rp-bqdEl6FF2yIIYINyPyoaxOV8toCDZovLOLuikeUM';
+
 export function getStoredSupabaseCredentials(): { url: string; key: string } {
   let url = '';
   let key = '';
@@ -28,10 +31,10 @@ export function getStoredSupabaseCredentials(): { url: string; key: string } {
   }
 
   if (!url) {
-    url = (import.meta.env.VITE_SUPABASE_URL as string) || '';
+    url = (import.meta.env.VITE_SUPABASE_URL as string) || DEFAULT_SUPABASE_URL;
   }
   if (!key) {
-    key = (import.meta.env.VITE_SUPABASE_ANON_KEY as string) || '';
+    key = (import.meta.env.VITE_SUPABASE_ANON_KEY as string) || DEFAULT_SUPABASE_KEY;
   }
 
   return { url: normalizeSupabaseUrl(url), key: cleanSupabaseKey(key) };

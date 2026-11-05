@@ -26,11 +26,26 @@ import {
 } from '../utils/supabaseClient';
 import { saveRecordsToIndexedDB } from '../utils/indexedDbStorage';
 
-function cleanIsoDate(val: any): string | null {
-  if (!val) return null;
-  if (typeof val !== 'string') return null;
-  const trimmed = val.trim();
-  if (!trimmed || trimmed === 'Invalid Date') return null;
+function cleanIsoDate(val: any, fallback = '2026-01-01'): string {
+  if (!val) return fallback;
+  if (val instanceof Date) {
+    if (!isNaN(val.getTime())) return val.toISOString().split('T')[0];
+    return fallback;
+  }
+  if (typeof val === 'number') {
+    if (val > 1000000000) {
+      const d = new Date(val);
+      if (!isNaN(d.getTime())) return d.toISOString().split('T')[0];
+    } else if (val > 20000 && val < 60000) {
+      const d = new Date((val - 25569) * 86400 * 1000);
+      if (!isNaN(d.getTime())) return d.toISOString().split('T')[0];
+    }
+    return fallback;
+  }
+  const trimmed = String(val).trim();
+  if (!trimmed || trimmed.toLowerCase() === 'invalid date' || trimmed.toLowerCase() === 'null') {
+    return fallback;
+  }
 
   if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
     return trimmed;
@@ -54,7 +69,7 @@ function cleanIsoDate(val: any): string | null {
     return parsed.toISOString().split('T')[0];
   }
 
-  return null;
+  return fallback;
 }
 
 interface SupabaseSyncModalProps {
@@ -128,44 +143,53 @@ export const SupabaseSyncModal: React.FC<SupabaseSyncModalProps> = ({
     if (saved.key && !inputKey) setInputKey(saved.key);
 
     try {
-      const res = await fetch('/api/supabase/status');
-      if (res.ok) {
-        const data = await res.json();
-        
-        if (data.connected) {
-          setStatus(data);
-        } else {
-          const clientTest = await testSupabaseConnection(saved.url, saved.key);
-          setStatus({
-            configured: clientTest.success || !!saved.url,
-            connected: clientTest.success,
-            projectUrl: saved.url || data.projectUrl,
-            visitsCount: clientTest.visitsCount || data.visitsCount || 0,
-            referralsCount: clientTest.referralsCount || data.referralsCount || 0,
-            errorDetail: clientTest.success ? null : clientTest.message,
-            message: clientTest.success
-              ? 'Terhubung langsung melalui Supabase Client SDK (Browser Direct & Vercel Ready).'
-              : (data.message || clientTest.message),
-          });
+      // 1. Direct client test (always works on Vercel without serverless)
+      const clientTest = await testSupabaseConnection(saved.url, saved.key);
+
+      // 2. Safe check of server status endpoint
+      let serverData: any = null;
+      try {
+        const res = await fetch('/api/supabase/status', {
+          headers: {
+            'x-supabase-url': saved.url || '',
+            'x-supabase-key': saved.key || '',
+          },
+        });
+        const isJson = res.headers.get('content-type')?.includes('application/json');
+        if (res.ok && isJson) {
+          serverData = await res.json();
         }
+      } catch {
+        // server endpoint not available (static Vercel hosting)
+      }
+
+      if (serverData && serverData.connected) {
+        setStatus(serverData);
       } else {
-        const clientTest = await testSupabaseConnection(saved.url, saved.key);
         setStatus({
           configured: clientTest.success || !!saved.url,
           connected: clientTest.success,
-          projectUrl: saved.url || null,
-          visitsCount: clientTest.visitsCount || 0,
-          referralsCount: clientTest.referralsCount || 0,
+          projectUrl: saved.url || serverData?.projectUrl || null,
+          visitsCount: clientTest.visitsCount || serverData?.visitsCount || 0,
+          referralsCount: clientTest.referralsCount || serverData?.referralsCount || 0,
           errorDetail: clientTest.success ? null : clientTest.message,
-          message: clientTest.message,
+          message: clientTest.success
+            ? 'Terhubung langsung melalui Supabase Client SDK (Browser Direct & Vercel Ready).'
+            : (serverData?.message || clientTest.message),
         });
       }
 
-      const schemaRes = await fetch('/api/supabase/schema');
-      if (schemaRes.ok) {
-        const schemaData = await schemaRes.json();
-        setSqlSchema(schemaData.sql || '');
-      } else {
+      // Safe check of SQL schema
+      try {
+        const schemaRes = await fetch('/api/supabase/schema');
+        const isJson = schemaRes.headers.get('content-type')?.includes('application/json');
+        if (schemaRes.ok && isJson) {
+          const schemaData = await schemaRes.json();
+          setSqlSchema(schemaData.sql || FALLBACK_SQL_SCHEMA);
+        } else {
+          setSqlSchema(FALLBACK_SQL_SCHEMA);
+        }
+      } catch {
         setSqlSchema(FALLBACK_SQL_SCHEMA);
       }
     } catch (err: any) {
@@ -256,8 +280,68 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
     setSyncingVisits(true);
     setFeedback(null);
 
-    const { url: sUrl, key: sKey } = getStoredSupabaseCredentials();
+    // 1. Prioritize Direct Supabase Client (works 100% reliably on Vercel & client SPA)
+    const client = getSupabaseClient();
+    if (client) {
+      try {
+        const seenIds = new Set<string>();
+        const rows: any[] = [];
+        for (let i = 0; i < visits.length; i++) {
+          const v = visits[i];
+          let rowId = v.id ? String(v.id).trim() : '';
+          if (!rowId || seenIds.has(rowId)) {
+            rowId = `visit-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`;
+          }
+          seenIds.add(rowId);
 
+          rows.push({
+            id: rowId,
+            visit_date: cleanIsoDate(v.tanggalKunjungan),
+            target_location: String(v.lokasiTujuan || 'Lokasi Kunjungan').trim(),
+            segment_type: String(v.jenisSegmen || 'Lainnya').trim(),
+            address: String(v.alamat || '').trim(),
+            purpose: String(v.maksudKunjungan || '').trim(),
+            notes: String(v.catatanHasil || '').trim(),
+            updated_at: new Date().toISOString(),
+          });
+        }
+
+        let directSuccess = true;
+        let count = 0;
+        const CHUNK = 100;
+        for (let i = 0; i < rows.length; i += CHUNK) {
+          const chunk = rows.slice(i, i + CHUNK);
+          const { error } = await client.from('marketing_visits').upsert(chunk, { onConflict: 'id' });
+          if (error) {
+            directSuccess = false;
+            const isMissing = error.code === '42P01' || error.message?.includes('does not exist');
+            setFeedback({ 
+              type: 'error', 
+              message: isMissing 
+                ? "Tabel 'marketing_visits' belum dibuat di Supabase. Salin dan jalankan skrip di tab 'Pensalinan Skrip SQL DDL'." 
+                : `Supabase: ${error.message}` 
+            });
+            break;
+          }
+          count += chunk.length;
+        }
+
+        if (directSuccess) {
+          setFeedback({
+            type: 'success',
+            message: `Berhasil menyinkronkan total ${count} data kunjungan ke database Supabase!`,
+          });
+          fetchStatus();
+          setSyncingVisits(false);
+          return;
+        }
+      } catch (clientErr: any) {
+        console.warn('Direct client sync notice:', clientErr);
+      }
+    }
+
+    // 2. Safe Fallback to /api/supabase/sync-visits
+    const { url: sUrl, key: sKey } = getStoredSupabaseCredentials();
     try {
       const res = await fetch('/api/supabase/sync-visits', {
         method: 'POST',
@@ -268,69 +352,22 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
         },
         body: JSON.stringify({ visits }),
       });
-      const data = await res.json();
-      if (data && data.success) {
-        setFeedback({ 
-          type: 'success', 
-          message: data.message || `Berhasil menyinkronkan ${visits.length} data kunjungan ke Supabase!` 
-        });
-        fetchStatus();
-      } else {
-        const client = getSupabaseClient();
-        if (client) {
-          const seenIds = new Set<string>();
-          const rows: any[] = [];
-          for (let i = 0; i < visits.length; i++) {
-            const v = visits[i];
-            let rowId = v.id ? String(v.id).trim() : '';
-            if (!rowId || seenIds.has(rowId)) {
-              rowId = `visit-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`;
-            }
-            seenIds.add(rowId);
-
-            rows.push({
-              id: rowId,
-              visit_date: cleanIsoDate(v.tanggalKunjungan),
-              target_location: String(v.lokasiTujuan || 'Lokasi Kunjungan').trim(),
-              segment_type: String(v.jenisSegmen || 'Lainnya').trim(),
-              address: String(v.alamat || '').trim(),
-              purpose: String(v.maksudKunjungan || '').trim(),
-              notes: String(v.catatanHasil || '').trim(),
-              updated_at: new Date().toISOString(),
-            });
-          }
-
-          let directSuccess = true;
-          let count = 0;
-          const CHUNK = 100;
-          for (let i = 0; i < rows.length; i += CHUNK) {
-            const chunk = rows.slice(i, i + CHUNK);
-            const { error } = await client.from('marketing_visits').upsert(chunk, { onConflict: 'id' });
-            if (error) {
-              directSuccess = false;
-              const isMissing = error.code === '42P01' || error.message?.includes('does not exist');
-              setFeedback({ 
-                type: 'error', 
-                message: isMissing 
-                  ? "Tabel 'marketing_visits' belum dibuat di Supabase. Salin dan jalankan skrip di tab 'Pensalinan Skrip SQL DDL'." 
-                  : `Supabase: ${error.message}` 
-              });
-              break;
-            }
-            count += chunk.length;
-          }
-
-          if (directSuccess) {
-            setFeedback({
-              type: 'success',
-              message: `Berhasil menyinkronkan ${count} data kunjungan langsung via Supabase Client!`,
-            });
-            fetchStatus();
-          }
+      const isJson = res.headers.get('content-type')?.includes('application/json');
+      if (res.ok && isJson) {
+        const data = await res.json();
+        if (data.success) {
+          setFeedback({ 
+            type: 'success', 
+            message: data.message || `Berhasil menyinkronkan ${visits.length} data kunjungan ke Supabase!` 
+          });
+          fetchStatus();
+          return;
         } else {
-          setFeedback({ type: 'error', message: data?.error || 'Gagal menyinkronkan data kunjungan ke Supabase.' });
+          setFeedback({ type: 'error', message: data.error || 'Gagal menyinkronkan ke Supabase' });
+          return;
         }
       }
+      setFeedback({ type: 'error', message: 'Gagal menghubungkan ke server atau database Supabase.' });
     } catch (err: any) {
       setFeedback({ type: 'error', message: err?.message || 'Koneksi gagal saat menyinkronkan kunjungan.' });
     } finally {
@@ -342,8 +379,53 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
   const handleFetchVisits = async () => {
     setFetchingVisits(true);
     setFeedback(null);
-    const { url: sUrl, key: sKey } = getStoredSupabaseCredentials();
 
+    // 1. Prioritize Direct Supabase Client
+    const client = getSupabaseClient();
+    if (client) {
+      try {
+        const { data: dbData, error } = await client
+          .from('marketing_visits')
+          .select('*')
+          .order('visit_date', { ascending: false });
+
+        if (!error && dbData && dbData.length > 0) {
+          const mapped: MarketingVisitRecord[] = dbData.map((r: any) => ({
+            id: r.id,
+            tanggalKunjungan: r.visit_date,
+            lokasiTujuan: r.target_location,
+            jenisSegmen: (r.segment_type as SegmentType) || 'Lainnya',
+            alamat: r.address || '',
+            wilayah: r.address ? r.address.split(',')[0] : 'Kota Sukabumi',
+            maksudKunjungan: r.purpose || '',
+            catatanHasil: r.notes || '',
+          }));
+          onVisitsLoaded(mapped);
+          setFeedback({
+            type: 'success',
+            message: `Berhasil menarik ${mapped.length} data kunjungan dari Supabase ke aplikasi!`,
+          });
+          fetchStatus();
+          setFetchingVisits(false);
+          return;
+        } else if (error) {
+          const isMissing = error.code === '42P01' || error.message?.includes('does not exist');
+          if (isMissing) {
+            setFeedback({ 
+              type: 'error', 
+              message: "Tabel 'marketing_visits' belum dibuat di Supabase. Salin dan jalankan skrip di tab 'Pensalinan Skrip SQL DDL'." 
+            });
+            setFetchingVisits(false);
+            return;
+          }
+        }
+      } catch (clientErr: any) {
+        console.warn('Direct client fetch notice:', clientErr);
+      }
+    }
+
+    // 2. Safe Fallback to /api/supabase/fetch-visits
+    const { url: sUrl, key: sKey } = getStoredSupabaseCredentials();
     try {
       const res = await fetch('/api/supabase/fetch-visits', {
         headers: {
@@ -351,59 +433,33 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
           'x-supabase-key': sKey || '',
         },
       });
-      const data = await res.json();
-      if (data && data.success && data.visits && data.visits.length > 0) {
-        const mappedVisits: MarketingVisitRecord[] = data.visits.map((v: any) => ({
-          id: v.id,
-          tanggalKunjungan: v.visitDate || v.tanggalKunjungan,
-          lokasiTujuan: v.targetLocation || v.lokasiTujuan,
-          jenisSegmen: (v.segmentType || v.jenisSegmen || 'Lainnya') as SegmentType,
-          alamat: v.address || v.alamat || '',
-          wilayah: v.address ? v.address.split(',')[0] : 'Kota Sukabumi',
-          maksudKunjungan: v.purpose || v.maksudKunjungan || '',
-          catatanHasil: v.notes || v.catatanHasil || '',
-        }));
-        onVisitsLoaded(mappedVisits);
-        setFeedback({
-          type: 'success',
-          message: `Berhasil memuat ${mappedVisits.length} data kunjungan dari Supabase ke aplikasi!`,
-        });
-        fetchStatus();
-      } else {
-        const client = getSupabaseClient();
-        if (client) {
-          const { data: dbData, error } = await client
-            .from('marketing_visits')
-            .select('*')
-            .order('visit_date', { ascending: false });
-
-          if (!error && dbData && dbData.length > 0) {
-            const mapped: MarketingVisitRecord[] = dbData.map((r: any) => ({
-              id: r.id,
-              tanggalKunjungan: r.visit_date,
-              lokasiTujuan: r.target_location,
-              jenisSegmen: (r.segment_type as SegmentType) || 'Lainnya',
-              alamat: r.address || '',
-              wilayah: r.address ? r.address.split(',')[0] : 'Kota Sukabumi',
-              maksudKunjungan: r.purpose || '',
-              catatanHasil: r.notes || '',
-            }));
-            onVisitsLoaded(mapped);
-            setFeedback({
-              type: 'success',
-              message: `Berhasil memuat ${mapped.length} data kunjungan langsung dari Supabase Client!`,
-            });
-            fetchStatus();
-          } else {
-            setFeedback({
-              type: 'info',
-              message: error ? `Supabase: ${error.message}` : 'Tabel marketing_visits di Supabase masih kosong.',
-            });
-          }
-        } else {
-          setFeedback({ type: 'error', message: data?.error || 'Gagal memuat data dari Supabase.' });
+      const isJson = res.headers.get('content-type')?.includes('application/json');
+      if (res.ok && isJson) {
+        const data = await res.json();
+        if (data.success && data.visits && data.visits.length > 0) {
+          const mappedVisits: MarketingVisitRecord[] = data.visits.map((v: any) => ({
+            id: v.id,
+            tanggalKunjungan: v.visitDate || v.tanggalKunjungan,
+            lokasiTujuan: v.targetLocation || v.lokasiTujuan,
+            jenisSegmen: (v.segmentType || v.jenisSegmen || 'Lainnya') as SegmentType,
+            alamat: v.address || v.alamat || '',
+            wilayah: v.address ? v.address.split(',')[0] : 'Kota Sukabumi',
+            maksudKunjungan: v.purpose || v.maksudKunjungan || '',
+            catatanHasil: v.notes || v.catatanHasil || '',
+          }));
+          onVisitsLoaded(mappedVisits);
+          setFeedback({
+            type: 'success',
+            message: `Berhasil memuat ${mappedVisits.length} data kunjungan dari Supabase!`,
+          });
+          fetchStatus();
+          return;
+        } else if (data.error) {
+          setFeedback({ type: 'error', message: data.error });
+          return;
         }
       }
+      setFeedback({ type: 'info', message: 'Tabel marketing_visits di Supabase masih kosong atau belum terisi data.' });
     } catch (err: any) {
       setFeedback({ type: 'error', message: err?.message || 'Koneksi gagal saat membaca data kunjungan.' });
     } finally {
@@ -420,8 +476,71 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
     setSyncingReferrals(true);
     setFeedback(null);
 
-    const { url: sUrl, key: sKey } = getStoredSupabaseCredentials();
+    // 1. Prioritize Direct Supabase Client
+    const client = getSupabaseClient();
+    if (client) {
+      try {
+        const seenIds = new Set<string>();
+        const rows: any[] = [];
+        for (let idx = 0; idx < referrals.length; idx++) {
+          const r = referrals[idx];
+          let rowId = r.id ? String(r.id).trim() : '';
+          if (!rowId || seenIds.has(rowId)) {
+            rowId = `ref-${Date.now()}-${idx}-${Math.random().toString(36).substring(2, 6)}`;
+          }
+          seenIds.add(rowId);
 
+          rows.push({
+            id: rowId,
+            entry_date: cleanIsoDate(r.tanggalMasuk),
+            referrer_name: String(r.perujukClean || r.perujukRaw || 'Perujuk Tidak Tercatat').trim(),
+            referrer_type: String(r.kategoriPerujuk === 'Internal' ? 'internal' : 'eksternal'),
+            referrer_address: String(r.alamatPerujukRaw || '').trim(),
+            target_poli: String(r.poliTujuan || '').trim(),
+            diagnosis: String(r.diagnosaAwal || '').trim(),
+            payment_method: String(r.kategoriPembayaran || 'Umum/Tunai').trim(),
+            patient_age_group: String(r.kelompokUsia || '').trim(),
+            patient_address: String(r.alamatPasienRaw || r.wilayahPasienNormal || '').trim(),
+            created_at: new Date().toISOString(),
+          });
+        }
+
+        let directSuccess = true;
+        const CHUNK = 100;
+        let count = 0;
+        for (let i = 0; i < rows.length; i += CHUNK) {
+          const chunk = rows.slice(i, i + CHUNK);
+          const { error } = await client.from('referral_records').upsert(chunk, { onConflict: 'id' });
+          if (error) {
+            directSuccess = false;
+            const isMissing = error.code === '42P01' || error.message?.includes('does not exist');
+            setFeedback({ 
+              type: 'error', 
+              message: isMissing 
+                ? "Tabel 'referral_records' belum dibuat di Supabase. Salin dan jalankan skrip di tab 'Pensalinan Skrip SQL DDL'." 
+                : `Supabase: ${error.message}` 
+            });
+            break;
+          }
+          count += chunk.length;
+        }
+
+        if (directSuccess) {
+          setFeedback({
+            type: 'success',
+            message: `Berhasil menyinkronkan total ${count} data rujukan pasien ke database Supabase!`,
+          });
+          fetchStatus();
+          setSyncingReferrals(false);
+          return;
+        }
+      } catch (clientErr: any) {
+        console.warn('Direct client sync referrals notice:', clientErr);
+      }
+    }
+
+    // 2. Safe Fallback to /api/supabase/sync-referrals
+    const { url: sUrl, key: sKey } = getStoredSupabaseCredentials();
     try {
       const res = await fetch('/api/supabase/sync-referrals', {
         method: 'POST',
@@ -432,75 +551,22 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
         },
         body: JSON.stringify({ records: referrals }),
       });
-      const data = await res.json();
-      if (data && data.success) {
-        setFeedback({
-          type: 'success',
-          message: data.message || `Berhasil menyinkronkan rujukan ke Supabase!`,
-        });
-        fetchStatus();
-      } else {
-        const client = getSupabaseClient();
-        if (client) {
-          const seenIds = new Set<string>();
-          const rows: any[] = [];
-          for (let idx = 0; idx < referrals.length; idx++) {
-            const r = referrals[idx];
-            let rowId = r.id ? String(r.id).trim() : '';
-            if (!rowId || seenIds.has(rowId)) {
-              rowId = `ref-${Date.now()}-${idx}-${Math.random().toString(36).substring(2, 6)}`;
-            }
-            seenIds.add(rowId);
-
-            rows.push({
-              id: rowId,
-              entry_date: cleanIsoDate(r.tanggalMasuk),
-              referrer_name: String(r.perujukClean || r.perujukRaw || 'Perujuk Tidak Tercatat').trim(),
-              referrer_type: String(r.kategoriPerujuk === 'Internal' ? 'internal' : 'eksternal'),
-              referrer_address: String(r.alamatPerujukRaw || '').trim(),
-              target_poli: String(r.poliTujuan || '').trim(),
-              diagnosis: String(r.diagnosaAwal || '').trim(),
-              payment_method: String(r.kategoriPembayaran || 'Umum/Tunai').trim(),
-              patient_age_group: String(r.kelompokUsia || '').trim(),
-              patient_address: String(r.alamatPasienRaw || r.wilayahPasienNormal || '').trim(),
-              created_at: new Date().toISOString(),
-            });
-          }
-
-          let directSuccess = true;
-          const CHUNK = 100;
-          let count = 0;
-          for (let i = 0; i < rows.length; i += CHUNK) {
-            const chunk = rows.slice(i, i + CHUNK);
-            const { error } = await client.from('referral_records').upsert(chunk, { onConflict: 'id' });
-            if (error) {
-              directSuccess = false;
-              const isMissing = error.code === '42P01' || error.message?.includes('does not exist');
-              setFeedback({ 
-                type: 'error', 
-                message: isMissing 
-                  ? "Tabel 'referral_records' belum dibuat di Supabase. Salin dan jalankan skrip di tab 'Pensalinan Skrip SQL DDL'." 
-                  : `Supabase: ${error.message}` 
-              });
-              break;
-            }
-            count += chunk.length;
-          }
-
-          if (directSuccess) {
-            setFeedback({
-              type: 'success',
-              message: `Berhasil menyinkronkan ${count} data rujukan via Supabase Client!`,
-            });
-            fetchStatus();
-          }
-        } else {
+      const isJson = res.headers.get('content-type')?.includes('application/json');
+      if (res.ok && isJson) {
+        const data = await res.json();
+        if (data.success) {
           setFeedback({
-            type: 'error',
-            message: data?.error || 'Gagal menyinkronkan data rujukan ke Supabase.',
+            type: 'success',
+            message: data.message || `Berhasil menyinkronkan data rujukan ke Supabase!`,
           });
+          fetchStatus();
+          return;
+        } else {
+          setFeedback({ type: 'error', message: data.error || 'Gagal menyinkronkan ke Supabase' });
+          return;
         }
       }
+      setFeedback({ type: 'error', message: 'Gagal menghubungi server database Supabase.' });
     } catch (err: any) {
       setFeedback({ type: 'error', message: err?.message || 'Koneksi gagal saat menyinkronkan rujukan.' });
     } finally {
@@ -512,6 +578,76 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
   const handleFetchReferrals = async () => {
     setFetchingReferrals(true);
     setFeedback(null);
+
+    // 1. Prioritize Direct Supabase Client
+    const client = getSupabaseClient();
+    if (client) {
+      try {
+        const { data: dbData, error } = await client
+          .from('referral_records')
+          .select('*')
+          .order('entry_date', { ascending: false })
+          .limit(5000);
+
+        if (!error && dbData && dbData.length > 0) {
+          const mapped: CleanReferralRecord[] = dbData.map((r: any) => {
+            const d = r.entry_date ? new Date(r.entry_date) : new Date();
+            const dayNames = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+            return {
+              id: r.id,
+              tanggalMasuk: r.entry_date || new Date().toISOString().split('T')[0],
+              bulan: r.entry_date ? r.entry_date.substring(0, 7) : '2026-01',
+              tahun: d.getFullYear(),
+              hariNama: dayNames[d.getDay()],
+              hariIndex: d.getDay(),
+              perujukRaw: r.referrer_name || '',
+              perujukClean: r.referrer_name || '',
+              kategoriPerujuk: r.referrer_type === 'internal' ? 'Internal' : 'Eksternal',
+              alamatPerujukRaw: r.referrer_address || '',
+              wilayahPerujuk: 'Kota/Kab Sukabumi',
+              kotaKabPerujuk: 'Kota Sukabumi',
+              noRujukanRaw: r.payment_method === 'BPJS' ? 'BPJS-REF' : '',
+              kategoriPembayaran: (r.payment_method === 'BPJS' ? 'BPJS' : 'Umum/Tunai') as PaymentCategory,
+              alamatPasienRaw: r.patient_address || '',
+              kelurahanPasien: 'Sukabumi',
+              kecamatanPasien: 'Lembursitu',
+              kotaKabPasien: 'Kota Sukabumi',
+              wilayahPasienNormal: r.patient_address || 'Sukabumi',
+              umurRaw: r.patient_age_group || '',
+              umurTahun: null,
+              kelompokUsia: (r.patient_age_group as AgeGroup) || '25–44 tahun',
+              poliTujuan: r.target_poli || 'Poli Umum',
+              diagnosaAwal: r.diagnosis || 'Pemeriksaan Umum',
+              kodeIcd: '',
+            };
+          });
+
+          if (onReferralsLoaded) onReferralsLoaded(mapped);
+          await saveRecordsToIndexedDB(mapped);
+          setFeedback({
+            type: 'success',
+            message: `Berhasil menarik ${mapped.length} data rujukan pasien langsung dari Supabase ke aplikasi!`,
+          });
+          fetchStatus();
+          setFetchingReferrals(false);
+          return;
+        } else if (error) {
+          const isMissing = error.code === '42P01' || error.message?.includes('does not exist');
+          if (isMissing) {
+            setFeedback({ 
+              type: 'error', 
+              message: "Tabel 'referral_records' belum dibuat di Supabase. Salin dan jalankan skrip di tab 'Pensalinan Skrip SQL DDL'." 
+            });
+            setFetchingReferrals(false);
+            return;
+          }
+        }
+      } catch (clientErr: any) {
+        console.warn('Direct client fetch referrals notice:', clientErr);
+      }
+    }
+
+    // 2. Safe Fallback to /api/supabase/fetch-referrals
     const { url: sUrl, key: sKey } = getStoredSupabaseCredentials();
     try {
       const res = await fetch('/api/supabase/fetch-referrals', {
@@ -520,75 +656,26 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
           'x-supabase-key': sKey || '',
         },
       });
-      const data = await res.json();
-      if (res.ok && data.success && data.records && data.records.length > 0) {
-        if (onReferralsLoaded) onReferralsLoaded(data.records);
-        await saveRecordsToIndexedDB(data.records);
-        setFeedback({
-          type: 'success',
-          message: `Berhasil menarik ${data.records.length} data rujukan pasien dari Supabase dan disimpan ke IndexedDB local!`,
-        });
-        fetchStatus();
-      } else {
-        const client = getSupabaseClient();
-        if (client) {
-          const { data: dbData, error } = await client
-            .from('referral_records')
-            .select('*')
-            .order('entry_date', { ascending: false })
-            .limit(5000);
-
-          if (!error && dbData && dbData.length > 0) {
-            const mapped: CleanReferralRecord[] = dbData.map((r: any) => {
-              const d = r.entry_date ? new Date(r.entry_date) : new Date();
-              const dayNames = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
-              return {
-                id: r.id,
-                tanggalMasuk: r.entry_date || new Date().toISOString().split('T')[0],
-                bulan: r.entry_date ? r.entry_date.substring(0, 7) : '2026-01',
-                tahun: d.getFullYear(),
-                hariNama: dayNames[d.getDay()],
-                hariIndex: d.getDay(),
-                perujukRaw: r.referrer_name || '',
-                perujukClean: r.referrer_name || '',
-                kategoriPerujuk: r.referrer_type === 'internal' ? 'Internal' : 'Eksternal',
-                alamatPerujukRaw: r.referrer_address || '',
-                wilayahPerujuk: 'Kota/Kab Sukabumi',
-                kotaKabPerujuk: 'Kota Sukabumi',
-                noRujukanRaw: r.payment_method === 'BPJS' ? 'BPJS-REF' : '',
-                kategoriPembayaran: (r.payment_method === 'BPJS' ? 'BPJS' : 'Umum/Tunai') as PaymentCategory,
-                alamatPasienRaw: r.patient_address || '',
-                kelurahanPasien: 'Sukabumi',
-                kecamatanPasien: 'Lembursitu',
-                kotaKabPasien: 'Kota Sukabumi',
-                wilayahPasienNormal: r.patient_address || 'Sukabumi',
-                umurRaw: r.patient_age_group || '',
-                umurTahun: null,
-                kelompokUsia: (r.patient_age_group as AgeGroup) || '25–44 tahun',
-                poliTujuan: r.target_poli || 'Poli Umum',
-                diagnosaAwal: r.diagnosis || 'Pemeriksaan Umum',
-                kodeIcd: '',
-              };
-            });
-            if (onReferralsLoaded) onReferralsLoaded(mapped);
-            await saveRecordsToIndexedDB(mapped);
-            setFeedback({
-              type: 'success',
-              message: `Berhasil memuat ${mapped.length} data rujukan pasien langsung dari Supabase Client!`,
-            });
-            fetchStatus();
-          } else {
-            setFeedback({
-              type: 'info',
-              message: error ? `Supabase: ${error.message}` : 'Tabel referral_records di Supabase masih kosong.',
-            });
-          }
-        } else {
-          setFeedback({ type: 'error', message: data?.error || 'Gagal memuat rujukan dari Supabase.' });
+      const isJson = res.headers.get('content-type')?.includes('application/json');
+      if (res.ok && isJson) {
+        const data = await res.json();
+        if (data.success && data.records && data.records.length > 0) {
+          if (onReferralsLoaded) onReferralsLoaded(data.records);
+          await saveRecordsToIndexedDB(data.records);
+          setFeedback({
+            type: 'success',
+            message: `Berhasil menarik ${data.records.length} data rujukan pasien dari Supabase!`,
+          });
+          fetchStatus();
+          return;
+        } else if (data.error) {
+          setFeedback({ type: 'error', message: data.error });
+          return;
         }
       }
+      setFeedback({ type: 'info', message: 'Tabel referral_records di Supabase masih kosong.' });
     } catch (err: any) {
-      setFeedback({ type: 'error', message: err.message || 'Koneksi gagal saat membaca data rujukan.' });
+      setFeedback({ type: 'error', message: err?.message || 'Koneksi gagal saat membaca data rujukan.' });
     } finally {
       setFetchingReferrals(false);
     }

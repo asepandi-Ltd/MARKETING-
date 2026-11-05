@@ -34,6 +34,7 @@ import {
   loadMediaFromIndexedDB, 
   deleteMediaFromIndexedDB 
 } from '../utils/indexedDbStorage';
+import { getSupabaseClient, getStoredSupabaseCredentials } from '../utils/supabaseClient';
 
 export type WelcomeMediaType = 
   | 'preset-slideshow' 
@@ -220,17 +221,47 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
   // Load remote welcome screen config from Supabase on mount
   useEffect(() => {
     async function loadCloudWelcomeConfig() {
+      // 1. Direct Supabase Client load (works immediately on Vercel without serverless)
       try {
-        const res = await fetch('/api/supabase/get-welcome-config');
-        if (res.ok) {
+        const client = getSupabaseClient();
+        if (client) {
+          const { data, error } = await client
+            .from('app_settings')
+            .select('value')
+            .eq('key', 'welcome_config')
+            .single();
+
+          if (!error && data?.value) {
+            setConfig((prev) => ({ ...prev, ...data.value }));
+            try {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(data.value));
+            } catch (e) {
+              // ignore
+            }
+            return;
+          }
+        }
+      } catch (err) {
+        console.warn('Direct load welcome config notice:', err);
+      }
+
+      // 2. Safe API fallback
+      try {
+        const { url: sUrl, key: sKey } = getStoredSupabaseCredentials();
+        const res = await fetch('/api/supabase/get-welcome-config', {
+          headers: {
+            'x-supabase-url': sUrl || '',
+            'x-supabase-key': sKey || '',
+          },
+        });
+        const isJson = res.headers.get('content-type')?.includes('application/json');
+        if (res.ok && isJson) {
           const data = await res.json();
           if (data.success && data.config) {
             setConfig((prev) => ({ ...prev, ...data.config }));
             try {
               localStorage.setItem(STORAGE_KEY, JSON.stringify(data.config));
-            } catch (e) {
-              // ignore
-            }
+            } catch (e) {}
           }
         }
       } catch (err) {
@@ -250,10 +281,30 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
         console.warn('Gagal menyimpan config ke localStorage:', e);
       }
 
-      // Sync config to Supabase Cloud
+      // 1. Direct Supabase Client save (works immediately on Vercel)
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          client
+            .from('app_settings')
+            .upsert({ key: 'welcome_config', value: updated, updated_at: new Date().toISOString() }, { onConflict: 'key' })
+            .then(({ error }) => {
+              if (error) console.warn('Supabase app_settings save notice:', error.message);
+            });
+        }
+      } catch (e) {
+        console.warn('Direct cloud config save notice:', e);
+      }
+
+      // 2. Server API sync fallback
+      const { url: sUrl, key: sKey } = getStoredSupabaseCredentials();
       fetch('/api/supabase/save-welcome-config', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'x-supabase-url': sUrl || '',
+          'x-supabase-key': sKey || '',
+        },
         body: JSON.stringify({ config: updated }),
       }).catch((e) => console.warn('Cloud config sync skipped:', e));
 

@@ -39,19 +39,22 @@ function normalizeSupabaseUrl(rawUrl: string): string {
   return url;
 }
 
+const DEFAULT_SUPABASE_URL = 'https://dariqcmfjnoopecliyar.supabase.co';
+const DEFAULT_SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRhcmlxY21mam5vb3BlY2xpeWFyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMxMzcwNzIsImV4cCI6MjEwODcxMzA3Mn0.Rp-bqdEl6FF2yIIYINyPyoaxOV8toCDZovLOLuikeUM';
+
 // Helper to initialize Supabase Client dynamically
 function getSupabaseBackendClient(req?: express.Request): { client: SupabaseClient | null; url: string } {
   const reqUrl = (req?.headers['x-supabase-url'] as string) || (req?.body?.supabaseUrl as string);
   const reqKey = (req?.headers['x-supabase-key'] as string) || (req?.body?.supabaseKey as string);
 
-  const rawUrl = (reqUrl && reqUrl.trim()) || process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
+  const rawUrl = (reqUrl && reqUrl.trim()) || process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || DEFAULT_SUPABASE_URL;
   const supabaseUrl = normalizeSupabaseUrl(rawUrl);
   const rawKey = 
     (reqKey && reqKey.trim()) ||
     process.env.SUPABASE_SERVICE_ROLE_KEY || 
     process.env.SUPABASE_ANON_KEY || 
     process.env.VITE_SUPABASE_ANON_KEY || 
-    '';
+    DEFAULT_SUPABASE_KEY;
   const supabaseKey = rawKey.trim().replace(/^['"]|['"]$/g, '');
 
   if (!supabaseUrl || !supabaseKey) {
