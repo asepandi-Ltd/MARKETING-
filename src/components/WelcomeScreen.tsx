@@ -217,7 +217,30 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
     return () => clearInterval(interval);
   }, [config.autoEnterSeconds, isCustomizeOpen, onEnterApp]);
 
-  // Save changes to localStorage
+  // Load remote welcome screen config from Supabase on mount
+  useEffect(() => {
+    async function loadCloudWelcomeConfig() {
+      try {
+        const res = await fetch('/api/supabase/get-welcome-config');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success && data.config) {
+            setConfig((prev) => ({ ...prev, ...data.config }));
+            try {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(data.config));
+            } catch (e) {
+              // ignore
+            }
+          }
+        }
+      } catch (err) {
+        // ignore
+      }
+    }
+    loadCloudWelcomeConfig();
+  }, []);
+
+  // Save changes to localStorage & Supabase Cloud
   const updateConfig = (partial: Partial<WelcomeCustomConfig>) => {
     setConfig((prev) => {
       const updated = { ...prev, ...partial };
@@ -226,6 +249,14 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
       } catch (e) {
         console.warn('Gagal menyimpan config ke localStorage:', e);
       }
+
+      // Sync config to Supabase Cloud
+      fetch('/api/supabase/save-welcome-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: updated }),
+      }).catch((e) => console.warn('Cloud config sync skipped:', e));
+
       return updated;
     });
   };

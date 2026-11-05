@@ -269,6 +269,23 @@ DO $$ BEGIN
     CREATE POLICY "Allow all access to referral_records" ON referral_records FOR ALL USING (true) WITH CHECK (true);
   END IF;
 END $$;
+
+-- 3. TABEL PENGATURAN TAMPILAN WELCOME SCREEN & BRANDING
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value JSONB NOT NULL,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE app_settings ENABLE ROW LEVEL SECURITY;
+
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies WHERE tablename = 'app_settings' AND policyname = 'Allow all access to app_settings'
+  ) THEN
+    CREATE POLICY "Allow all access to app_settings" ON app_settings FOR ALL USING (true) WITH CHECK (true);
+  END IF;
+END $$;
 `;
 
 // Get Supabase Status
@@ -531,6 +548,55 @@ app.get('/api/supabase/fetch-referrals', async (req, res) => {
   } catch (error: any) {
     console.error('Error fetching referrals from Supabase:', error);
     res.status(500).json({ success: false, error: error.message || 'Gagal memuat rujukan dari Supabase' });
+  }
+});
+
+// Save Welcome Screen Configuration
+app.post('/api/supabase/save-welcome-config', async (req, res) => {
+  const { client } = getSupabaseBackendClient();
+  if (!client) {
+    return res.status(400).json({ success: false, error: 'Supabase belum dikonfigurasi di server.' });
+  }
+
+  try {
+    const { config } = req.body;
+    if (!config) return res.status(400).json({ success: false, error: 'Konfigurasi tidak valid.' });
+
+    const { error } = await client
+      .from('app_settings')
+      .upsert({ key: 'welcome_config', value: config, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+
+    if (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    res.json({ success: true, message: 'Konfigurasi Welcome Screen berhasil disimpan ke Supabase cloud.' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Get Welcome Screen Configuration
+app.get('/api/supabase/get-welcome-config', async (req, res) => {
+  const { client } = getSupabaseBackendClient();
+  if (!client) {
+    return res.status(400).json({ success: false, error: 'Supabase belum dikonfigurasi di server.' });
+  }
+
+  try {
+    const { data, error } = await client
+      .from('app_settings')
+      .select('value')
+      .eq('key', 'welcome_config')
+      .single();
+
+    if (error || !data) {
+      return res.json({ success: false, config: null });
+    }
+
+    res.json({ success: true, config: data.value });
+  } catch (err: any) {
+    res.json({ success: false, config: null });
   }
 });
 
