@@ -109,6 +109,7 @@ export const SupabaseSyncModal: React.FC<SupabaseSyncModalProps> = ({
   const [copiedSql, setCopiedSql] = useState(false);
   const [copiedEnv, setCopiedEnv] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
+  const [fetchProgress, setFetchProgress] = useState<{ current: number; total: number; percent: number } | null>(null);
   const [activeSubTab, setActiveSubTab] = useState<'sync' | 'credentials' | 'sql' | 'vercel'>('sync');
 
   // Input states for direct UI credentials
@@ -375,22 +376,59 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
     }
   };
 
-  // Fetch visits from Supabase
+  // Fetch visits from Supabase with full pagination
   const handleFetchVisits = async () => {
     setFetchingVisits(true);
     setFeedback(null);
 
-    // 1. Prioritize Direct Supabase Client
+    // 1. Prioritize Direct Supabase Client with full pagination
     const client = getSupabaseClient();
     if (client) {
       try {
-        const { data: dbData, error } = await client
+        const { count: totalCount, error: countErr } = await client
           .from('marketing_visits')
-          .select('*')
-          .order('visit_date', { ascending: false });
+          .select('*', { count: 'exact', head: true });
 
-        if (!error && dbData && dbData.length > 0) {
-          const mapped: MarketingVisitRecord[] = dbData.map((r: any) => ({
+        if (countErr) {
+          const isMissing = countErr.code === '42P01' || countErr.message?.includes('does not exist');
+          if (isMissing) {
+            setFeedback({ 
+              type: 'error', 
+              message: "Tabel 'marketing_visits' belum dibuat di Supabase. Salin dan jalankan skrip di tab 'Pensalinan Skrip SQL DDL'." 
+            });
+            setFetchingVisits(false);
+            return;
+          }
+        }
+
+        const totalVisits = totalCount || 0;
+        if (totalVisits === 0) {
+          setFeedback({ type: 'info', message: 'Tabel marketing_visits di Supabase masih kosong.' });
+          setFetchingVisits(false);
+          return;
+        }
+
+        const PAGE_SIZE = 1000;
+        const totalPages = Math.ceil(totalVisits / PAGE_SIZE);
+        const pages: number[] = Array.from({ length: totalPages }, (_, i) => i);
+
+        const pagePromises = pages.map(async (pageIdx) => {
+          const from = pageIdx * PAGE_SIZE;
+          const to = from + PAGE_SIZE - 1;
+          const { data } = await client
+            .from('marketing_visits')
+            .select('*')
+            .order('visit_date', { ascending: false })
+            .range(from, to);
+          return { pageIdx, data: data || [] };
+        });
+
+        const results = await Promise.all(pagePromises);
+        results.sort((a, b) => a.pageIdx - b.pageIdx);
+        const allVisitsData = results.flatMap((r) => r.data);
+
+        if (allVisitsData.length > 0) {
+          const mapped: MarketingVisitRecord[] = allVisitsData.map((r: any) => ({
             id: r.id,
             tanggalKunjungan: r.visit_date,
             lokasiTujuan: r.target_location,
@@ -401,23 +439,18 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
             catatanHasil: r.notes || '',
           }));
           onVisitsLoaded(mapped);
+          try {
+            localStorage.setItem('al_mulk_marketing_visits', JSON.stringify(mapped));
+          } catch (e) {
+            // ignore
+          }
           setFeedback({
             type: 'success',
-            message: `Berhasil menarik ${mapped.length} data kunjungan dari Supabase ke aplikasi!`,
+            message: `Berhasil menarik SELURUH ${mapped.length.toLocaleString('id-ID')} data kunjungan lapangan dari Supabase Cloud!`,
           });
           fetchStatus();
           setFetchingVisits(false);
           return;
-        } else if (error) {
-          const isMissing = error.code === '42P01' || error.message?.includes('does not exist');
-          if (isMissing) {
-            setFeedback({ 
-              type: 'error', 
-              message: "Tabel 'marketing_visits' belum dibuat di Supabase. Salin dan jalankan skrip di tab 'Pensalinan Skrip SQL DDL'." 
-            });
-            setFetchingVisits(false);
-            return;
-          }
         }
       } catch (clientErr: any) {
         console.warn('Direct client fetch notice:', clientErr);
@@ -448,9 +481,12 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
             catatanHasil: v.notes || v.catatanHasil || '',
           }));
           onVisitsLoaded(mappedVisits);
+          try {
+            localStorage.setItem('al_mulk_marketing_visits', JSON.stringify(mappedVisits));
+          } catch (e) {}
           setFeedback({
             type: 'success',
-            message: `Berhasil memuat ${mappedVisits.length} data kunjungan dari Supabase!`,
+            message: `Berhasil memuat ${mappedVisits.length.toLocaleString('id-ID')} data kunjungan dari Supabase!`,
           });
           fetchStatus();
           return;
@@ -574,25 +610,89 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
     }
   };
 
-  // Fetch Referral Records from Supabase
+  // Fetch Referral Records from Supabase with full high-speed concurrent pagination
   const handleFetchReferrals = async () => {
     setFetchingReferrals(true);
     setFeedback(null);
+    setFetchProgress(null);
 
-    // 1. Prioritize Direct Supabase Client
+    // 1. Prioritize Direct Supabase Client (handles all 32,000+ records)
     const client = getSupabaseClient();
     if (client) {
       try {
-        const { data: dbData, error } = await client
+        const { count: totalCount, error: countErr } = await client
           .from('referral_records')
-          .select('*')
-          .order('entry_date', { ascending: false })
-          .limit(5000);
+          .select('*', { count: 'exact', head: true });
 
-        if (!error && dbData && dbData.length > 0) {
-          const mapped: CleanReferralRecord[] = dbData.map((r: any) => {
+        if (countErr) {
+          const isMissing = countErr.code === '42P01' || countErr.message?.includes('does not exist');
+          if (isMissing) {
+            setFeedback({ 
+              type: 'error', 
+              message: "Tabel 'referral_records' belum dibuat di Supabase. Salin dan jalankan skrip di tab 'Pensalinan Skrip SQL DDL'." 
+            });
+            setFetchingReferrals(false);
+            return;
+          }
+        }
+
+        const totalRecords = totalCount || 0;
+        if (totalRecords === 0) {
+          setFeedback({ type: 'info', message: 'Tabel referral_records di Supabase masih kosong.' });
+          setFetchingReferrals(false);
+          return;
+        }
+
+        const PAGE_SIZE = 1000;
+        const totalPages = Math.ceil(totalRecords / PAGE_SIZE);
+        const pages: number[] = Array.from({ length: totalPages }, (_, i) => i);
+
+        setFetchProgress({ current: 0, total: totalRecords, percent: 0 });
+        setFeedback({
+          type: 'info',
+          message: `Sedang mengunduh seluruh ${totalRecords.toLocaleString('id-ID')} data rujukan dari Supabase Cloud... (0%)`,
+        });
+
+        // Fetch in concurrent batches of 6 pages for high speed & reliability
+        const CONCURRENCY = 6;
+        const pageResults: { pageIdx: number; data: any[] }[] = [];
+        let fetchedSoFar = 0;
+
+        for (let i = 0; i < pages.length; i += CONCURRENCY) {
+          const chunkPages = pages.slice(i, i + CONCURRENCY);
+          const batchPromises = chunkPages.map(async (pageIdx) => {
+            const from = pageIdx * PAGE_SIZE;
+            const to = from + PAGE_SIZE - 1;
+            const { data } = await client
+              .from('referral_records')
+              .select('*')
+              .order('entry_date', { ascending: false })
+              .range(from, to);
+            return { pageIdx, data: data || [] };
+          });
+
+          const batch = await Promise.all(batchPromises);
+          pageResults.push(...batch);
+
+          for (const b of batch) {
+            fetchedSoFar += b.data.length;
+          }
+
+          const percent = Math.min(100, Math.round((fetchedSoFar / totalRecords) * 100));
+          setFetchProgress({ current: fetchedSoFar, total: totalRecords, percent });
+          setFeedback({
+            type: 'info',
+            message: `Mengunduh data rujukan: ${fetchedSoFar.toLocaleString('id-ID')} / ${totalRecords.toLocaleString('id-ID')} baris (${percent}%)...`,
+          });
+        }
+
+        pageResults.sort((a, b) => a.pageIdx - b.pageIdx);
+        const allDbData = pageResults.flatMap((r) => r.data);
+
+        if (allDbData.length > 0) {
+          const dayNames = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+          const mapped: CleanReferralRecord[] = allDbData.map((r: any) => {
             const d = r.entry_date ? new Date(r.entry_date) : new Date();
-            const dayNames = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
             return {
               id: r.id,
               tanggalMasuk: r.entry_date || new Date().toISOString().split('T')[0],
@@ -624,23 +724,19 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
 
           if (onReferralsLoaded) onReferralsLoaded(mapped);
           await saveRecordsToIndexedDB(mapped);
+          try {
+            localStorage.setItem('al_mulk_is_user_uploaded', 'true');
+            localStorage.setItem('al_mulk_uploaded_filename', `Supabase Cloud (${mapped.length.toLocaleString('id-ID')} Data Rujukan)`);
+          } catch (e) {}
+
           setFeedback({
             type: 'success',
-            message: `Berhasil menarik ${mapped.length} data rujukan pasien langsung dari Supabase ke aplikasi!`,
+            message: `Berhasil menarik SELURUH ${mapped.length.toLocaleString('id-ID')} data rujukan pasien dari Supabase Cloud ke aplikasi!`,
           });
+          setFetchProgress(null);
           fetchStatus();
           setFetchingReferrals(false);
           return;
-        } else if (error) {
-          const isMissing = error.code === '42P01' || error.message?.includes('does not exist');
-          if (isMissing) {
-            setFeedback({ 
-              type: 'error', 
-              message: "Tabel 'referral_records' belum dibuat di Supabase. Salin dan jalankan skrip di tab 'Pensalinan Skrip SQL DDL'." 
-            });
-            setFetchingReferrals(false);
-            return;
-          }
         }
       } catch (clientErr: any) {
         console.warn('Direct client fetch referrals notice:', clientErr);
@@ -664,12 +760,14 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
           await saveRecordsToIndexedDB(data.records);
           setFeedback({
             type: 'success',
-            message: `Berhasil menarik ${data.records.length} data rujukan pasien dari Supabase!`,
+            message: `Berhasil menarik ${data.records.length.toLocaleString('id-ID')} data rujukan pasien dari Supabase!`,
           });
+          setFetchProgress(null);
           fetchStatus();
           return;
         } else if (data.error) {
           setFeedback({ type: 'error', message: data.error });
+          setFetchProgress(null);
           return;
         }
       }
@@ -677,6 +775,7 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
     } catch (err: any) {
       setFeedback({ type: 'error', message: err?.message || 'Koneksi gagal saat membaca data rujukan.' });
     } finally {
+      setFetchProgress(null);
       setFetchingReferrals(false);
     }
   };
@@ -822,6 +921,27 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
               </button>
             </div>
           </div>
+
+          {/* Live Fetching Progress Bar */}
+          {fetchProgress && (
+            <div className="p-4 rounded-xl border bg-emerald-950/40 border-emerald-500/50 text-emerald-200 space-y-2.5 shadow-lg animate-pulse">
+              <div className="flex justify-between items-center text-xs font-semibold">
+                <span className="flex items-center gap-2">
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+                  Mengunduh seluruh data rujukan pasien dari Supabase Cloud...
+                </span>
+                <span className="font-mono text-emerald-300">
+                  {fetchProgress.current.toLocaleString('id-ID')} / {fetchProgress.total.toLocaleString('id-ID')} baris ({fetchProgress.percent}%)
+                </span>
+              </div>
+              <div className="w-full bg-slate-800 rounded-full h-2.5 overflow-hidden border border-emerald-500/30">
+                <div 
+                  className="bg-gradient-to-r from-emerald-500 to-teal-400 h-2.5 rounded-full transition-all duration-200" 
+                  style={{ width: `${fetchProgress.percent}%` }}
+                />
+              </div>
+            </div>
+          )}
 
           {/* Feedback alerts */}
           {feedback && (
