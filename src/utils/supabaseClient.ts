@@ -3,6 +3,19 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 const STORAGE_URL_KEY = 'al_mulk_custom_supabase_url';
 const STORAGE_ANON_KEY = 'al_mulk_custom_supabase_anon_key';
 
+export function normalizeSupabaseUrl(rawUrl: string): string {
+  if (!rawUrl) return '';
+  let url = rawUrl.trim().replace(/^['"]|['"]$/g, '');
+  url = url.replace(/\/rest\/v1\/?$/i, '');
+  url = url.replace(/\/+$/, '');
+  return url;
+}
+
+export function cleanSupabaseKey(rawKey: string): string {
+  if (!rawKey) return '';
+  return rawKey.trim().replace(/^['"]|['"]$/g, '');
+}
+
 export function getStoredSupabaseCredentials(): { url: string; key: string } {
   let url = '';
   let key = '';
@@ -21,19 +34,21 @@ export function getStoredSupabaseCredentials(): { url: string; key: string } {
     key = (import.meta.env.VITE_SUPABASE_ANON_KEY as string) || '';
   }
 
-  return { url, key };
+  return { url: normalizeSupabaseUrl(url), key: cleanSupabaseKey(key) };
 }
 
 export function saveStoredSupabaseCredentials(url: string, key: string) {
   try {
-    if (url) {
-      localStorage.setItem(STORAGE_URL_KEY, url.trim());
+    const cleanUrl = normalizeSupabaseUrl(url);
+    const cleanKey = cleanSupabaseKey(key);
+    if (cleanUrl) {
+      localStorage.setItem(STORAGE_URL_KEY, cleanUrl);
     } else {
       localStorage.removeItem(STORAGE_URL_KEY);
     }
 
-    if (key) {
-      localStorage.setItem(STORAGE_ANON_KEY, key.trim());
+    if (cleanKey) {
+      localStorage.setItem(STORAGE_ANON_KEY, cleanKey);
     } else {
       localStorage.removeItem(STORAGE_ANON_KEY);
     }

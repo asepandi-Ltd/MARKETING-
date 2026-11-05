@@ -26,6 +26,7 @@ import { SupabaseSyncModal } from './components/SupabaseSyncModal';
 import { MarketingVisitRecord } from './types/marketingVisit';
 import { generateAlMulkMarketingVisits, correlateVisitsWithReferrals } from './utils/marketingVisitParser';
 import { WelcomeScreen } from './components/WelcomeScreen';
+import { getStoredSupabaseCredentials } from './utils/supabaseClient';
 
 const INITIAL_FILTERS: FilterState = {
   startDate: '',
@@ -287,9 +288,14 @@ export default function App() {
 
         // Auto Sync to Supabase if enabled
         if (localStorage.getItem('al_mulk_auto_sync_supabase') === 'true') {
+          const creds = getStoredSupabaseCredentials();
           fetch('/api/supabase/sync-referrals', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 
+              'Content-Type': 'application/json',
+              'x-supabase-url': creds.url || '',
+              'x-supabase-key': creds.key || '',
+            },
             body: JSON.stringify({ records: newRecords }),
           }).catch((e) => console.warn('Auto sync referral failed:', e));
         }

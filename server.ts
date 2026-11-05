@@ -29,14 +29,30 @@ function getGenAIClient(): GoogleGenAI | null {
   });
 }
 
+function normalizeSupabaseUrl(rawUrl: string): string {
+  if (!rawUrl) return '';
+  let url = rawUrl.trim().replace(/^['"]|['"]$/g, '');
+  // Strip any accidental /rest/v1 or /rest/v1/ suffix copied from Supabase API dashboard
+  url = url.replace(/\/rest\/v1\/?$/i, '');
+  // Strip trailing slashes
+  url = url.replace(/\/+$/, '');
+  return url;
+}
+
 // Helper to initialize Supabase Client dynamically
-function getSupabaseBackendClient(): { client: SupabaseClient | null; url: string } {
-  const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
-  const supabaseKey = 
+function getSupabaseBackendClient(req?: express.Request): { client: SupabaseClient | null; url: string } {
+  const reqUrl = (req?.headers['x-supabase-url'] as string) || (req?.body?.supabaseUrl as string);
+  const reqKey = (req?.headers['x-supabase-key'] as string) || (req?.body?.supabaseKey as string);
+
+  const rawUrl = (reqUrl && reqUrl.trim()) || process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
+  const supabaseUrl = normalizeSupabaseUrl(rawUrl);
+  const rawKey = 
+    (reqKey && reqKey.trim()) ||
     process.env.SUPABASE_SERVICE_ROLE_KEY || 
     process.env.SUPABASE_ANON_KEY || 
     process.env.VITE_SUPABASE_ANON_KEY || 
     '';
+  const supabaseKey = rawKey.trim().replace(/^['"]|['"]$/g, '');
 
   if (!supabaseUrl || !supabaseKey) {
     return { client: null, url: '' };
@@ -47,15 +63,15 @@ function getSupabaseBackendClient(): { client: SupabaseClient | null; url: strin
       auth: { persistSession: false },
     });
     return { client, url: supabaseUrl };
-  } catch (err) {
-    console.error('Failed to initialize Supabase backend client:', err);
+  } catch (err: any) {
+    console.warn('Supabase backend initialization notice:', err?.message || err);
     return { client: null, url: supabaseUrl };
   }
 }
 
 // Health check
 app.get('/api/health', (req, res) => {
-  const { client, url } = getSupabaseBackendClient();
+  const { client, url } = getSupabaseBackendClient(req);
   const aiClient = getGenAIClient();
   res.json({ 
     status: 'ok', 
@@ -290,7 +306,7 @@ END $$;
 
 // Get Supabase Status
 app.get('/api/supabase/status', async (req, res) => {
-  const { client, url } = getSupabaseBackendClient();
+  const { client, url } = getSupabaseBackendClient(req);
   const isConfigured = !!client;
   let connectionValid = false;
   let visitsCount = 0;
@@ -337,48 +353,114 @@ app.get('/api/supabase/schema', (req, res) => {
   res.json({ sql: SUPABASE_DDL_SCHEMA });
 });
 
+function cleanIsoDate(val: any, fallbackDate = '2026-01-01'): string {
+  if (!val) return fallbackDate;
+  if (val instanceof Date) {
+    if (!isNaN(val.getTime())) {
+      return val.toISOString().split('T')[0];
+    }
+    return fallbackDate;
+  }
+  if (typeof val === 'number') {
+    if (val > 1000000000) {
+      const d = new Date(val);
+      if (!isNaN(d.getTime())) return d.toISOString().split('T')[0];
+    } else if (val > 20000 && val < 60000) {
+      const d = new Date((val - 25569) * 86400 * 1000);
+      if (!isNaN(d.getTime())) return d.toISOString().split('T')[0];
+    }
+    return fallbackDate;
+  }
+  const str = String(val).trim();
+  if (!str || str.toLowerCase() === 'invalid date' || str.toLowerCase() === 'null') {
+    return fallbackDate;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
+    return str;
+  }
+
+  if (str.includes('T')) {
+    const part = str.split('T')[0];
+    if (/^\d{4}-\d{2}-\d{2}$/.test(part)) return part;
+  }
+
+  if (/^\d{1,2}[\/-]\d{1,2}[\/-]\d{4}$/.test(str)) {
+    const parts = str.split(/[\/-]/);
+    const day = parts[0].padStart(2, '0');
+    const month = parts[1].padStart(2, '0');
+    const year = parts[2];
+    return `${year}-${month}-${day}`;
+  }
+
+  const parsed = new Date(str);
+  if (!isNaN(parsed.getTime())) {
+    return parsed.toISOString().split('T')[0];
+  }
+
+  return fallbackDate;
+}
+
 // Sync Marketing Visits to Supabase with chunk batching
 app.post('/api/supabase/sync-visits', async (req, res) => {
-  const { client } = getSupabaseBackendClient();
+  const { client } = getSupabaseBackendClient(req);
   if (!client) {
-    return res.status(400).json({
+    return res.json({
       success: false,
-      error: 'Supabase belum dikonfigurasi. Mohon tambahkan VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY di Environment Variables Vercel / AI Studio.',
+      error: 'Supabase belum dikonfigurasi. Mohon isi URL & Anon Key di menu Database & Vercel Sync atau Environment Variables.',
     });
   }
 
   try {
     const { visits } = req.body;
     if (!Array.isArray(visits) || visits.length === 0) {
-      return res.status(400).json({ success: false, error: 'Data kunjungan kosong atau tidak valid.' });
+      return res.json({ success: false, error: 'Data kunjungan kosong atau tidak valid.' });
     }
 
-    const rows = visits.map((v: any, index: number) => ({
-      id: v.id || `visit-${Date.now()}-${index}`,
-      visit_date: v.visitDate || new Date().toISOString().split('T')[0],
-      target_location: v.targetLocation || 'Tanpa Nama',
-      segment_type: v.segmentType || 'Lainnya',
-      address: v.address || '',
-      purpose: v.purpose || '',
-      notes: v.notes || '',
-      updated_at: new Date().toISOString(),
-    }));
+    // Deduplicate by ID to prevent Postgres "ON CONFLICT DO UPDATE command cannot affect row a second time"
+    const seenIds = new Set<string>();
+    const uniqueRows: any[] = [];
 
-    // Process in chunks of 500
-    const CHUNK_SIZE = 500;
+    for (let index = 0; index < visits.length; index++) {
+      const v = visits[index];
+      let rowId = v.id ? String(v.id).trim() : '';
+      if (!rowId || seenIds.has(rowId)) {
+        rowId = `visit-${Date.now()}-${index}-${Math.random().toString(36).substring(2, 7)}`;
+      }
+      seenIds.add(rowId);
+
+      uniqueRows.push({
+        id: rowId,
+        visit_date: cleanIsoDate(v.tanggalKunjungan || v.visitDate),
+        target_location: String(v.lokasiTujuan || v.targetLocation || 'Lokasi Kunjungan').trim(),
+        segment_type: String(v.jenisSegmen || v.segmentType || 'Lainnya').trim(),
+        address: String(v.alamat || v.address || '').trim(),
+        purpose: String(v.maksudKunjungan || v.purpose || '').trim(),
+        notes: String(v.catatanHasil || v.notes || '').trim(),
+        updated_at: new Date().toISOString(),
+      });
+    }
+
+    // Process in safe chunks of 100
+    const CHUNK_SIZE = 100;
     let syncedTotal = 0;
 
-    for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
-      const chunk = rows.slice(i, i + CHUNK_SIZE);
+    for (let i = 0; i < uniqueRows.length; i += CHUNK_SIZE) {
+      const chunk = uniqueRows.slice(i, i + CHUNK_SIZE);
       const { error } = await client
         .from('marketing_visits')
         .upsert(chunk, { onConflict: 'id' });
 
       if (error) {
-        console.error('Supabase upsert error in chunk:', error);
-        return res.status(500).json({
+        console.warn('Supabase marketing_visits sync notice:', error.message || error);
+        const isTableMissing = error.code === '42P01' || error.message?.includes('does not exist');
+        return res.json({
           success: false,
-          error: `Supabase Error pada baris ${i + 1}: ${error.message}. Pastikan skrip tabel 'marketing_visits' sudah dijalankan di Supabase SQL Editor.`,
+          isTableMissing,
+          code: error.code,
+          error: isTableMissing
+            ? `Tabel 'marketing_visits' belum dibuat di database Supabase Anda. Buka menu 'Database & Vercel Sync' > tab 'Pensalinan Skrip SQL DDL', lalu jalankan skrip tersebut di Supabase SQL Editor.`
+            : `Supabase: ${error.message || 'Gagal menyimpan kunjungan marketing ke Supabase'}.`,
         });
       }
       syncedTotal += chunk.length;
@@ -391,16 +473,16 @@ app.post('/api/supabase/sync-visits', async (req, res) => {
       timestamp: new Date().toISOString(),
     });
   } catch (error: any) {
-    console.error('Error syncing visits to Supabase:', error);
-    res.status(500).json({ success: false, error: error.message || 'Gagal menyinkronkan ke Supabase' });
+    console.warn('Supabase sync-visits notice:', error?.message || error);
+    res.json({ success: false, error: error?.message || 'Gagal menyinkronkan ke Supabase' });
   }
 });
 
 // Fetch Marketing Visits from Supabase
 app.get('/api/supabase/fetch-visits', async (req, res) => {
-  const { client } = getSupabaseBackendClient();
+  const { client } = getSupabaseBackendClient(req);
   if (!client) {
-    return res.status(400).json({
+    return res.json({
       success: false,
       error: 'Supabase belum dikonfigurasi di server.',
     });
@@ -413,20 +495,27 @@ app.get('/api/supabase/fetch-visits', async (req, res) => {
       .order('visit_date', { ascending: false });
 
     if (error) {
-      return res.status(500).json({
+      console.warn('Supabase fetch-visits notice:', error.message || error);
+      return res.json({
         success: false,
-        error: `Gagal membaca dari Supabase: ${error.message}. Pastikan tabel 'marketing_visits' sudah ada di Supabase.`,
+        error: `Gagal membaca dari Supabase: ${error.message || 'Tabel belum ada'}.`,
       });
     }
 
     const visits = (data || []).map((r: any) => ({
       id: r.id,
       visitDate: r.visit_date,
+      tanggalKunjungan: r.visit_date,
       targetLocation: r.target_location,
+      lokasiTujuan: r.target_location,
       segmentType: r.segment_type,
+      jenisSegmen: r.segment_type,
       address: r.address || '',
+      alamat: r.address || '',
       purpose: r.purpose || '',
+      maksudKunjungan: r.purpose || '',
       notes: r.notes || '',
+      catatanHasil: r.notes || '',
     }));
 
     res.json({
@@ -435,43 +524,56 @@ app.get('/api/supabase/fetch-visits', async (req, res) => {
       count: visits.length,
     });
   } catch (error: any) {
-    console.error('Error fetching visits from Supabase:', error);
-    res.status(500).json({ success: false, error: error.message || 'Gagal memuat dari Supabase' });
+    console.warn('Supabase fetch-visits exception:', error?.message || error);
+    res.json({ success: false, error: error?.message || 'Gagal memuat dari Supabase' });
   }
 });
 
 // Sync Referral Records to Supabase with chunk batching
 app.post('/api/supabase/sync-referrals', async (req, res) => {
-  const { client } = getSupabaseBackendClient();
+  const { client } = getSupabaseBackendClient(req);
   if (!client) {
-    return res.status(400).json({
+    return res.json({
       success: false,
-      error: 'Supabase belum dikonfigurasi di server.',
+      error: 'Supabase belum dikonfigurasi. Mohon isi URL & Anon Key di menu Database & Vercel Sync atau Environment Variables.',
     });
   }
 
   try {
     const { records } = req.body;
     if (!Array.isArray(records) || records.length === 0) {
-      return res.status(400).json({ success: false, error: 'Data rujukan kosong atau tidak valid.' });
+      return res.json({ success: false, error: 'Data rujukan kosong atau tidak valid.' });
     }
 
-    const safeRecords = records.map((r: any, idx: number) => ({
-      id: r.id || `ref-${Date.now()}-${idx}`,
-      entry_date: r.tanggalMasuk || null,
-      referrer_name: r.perujuk || r.perujukClean || 'Perujuk Tidak Tercatat',
-      referrer_type: r.tipePerujuk || 'eksternal',
-      referrer_address: r.alamatPerujuk || '',
-      target_poli: r.poliTujuan || r.poli || '',
-      diagnosis: r.diagnosaAwal || r.diagnosa || '',
-      payment_method: r.kategoriPembayaran || r.caraBayar || '',
-      patient_age_group: r.kelompokUmur || '',
-      patient_address: r.alamatPasien || '',
-      created_at: new Date().toISOString(),
-    }));
+    // Deduplicate by ID to prevent Postgres "ON CONFLICT DO UPDATE command cannot affect row a second time"
+    const seenIds = new Set<string>();
+    const safeRecords: any[] = [];
 
-    // Process in chunks of 500 for safety and speed
-    const CHUNK_SIZE = 500;
+    for (let idx = 0; idx < records.length; idx++) {
+      const r = records[idx];
+      let rowId = r.id ? String(r.id).trim() : '';
+      if (!rowId || seenIds.has(rowId)) {
+        rowId = `ref-${Date.now()}-${idx}-${Math.random().toString(36).substring(2, 7)}`;
+      }
+      seenIds.add(rowId);
+
+      safeRecords.push({
+        id: rowId,
+        entry_date: cleanIsoDate(r.tanggalMasuk || r.entry_date),
+        referrer_name: String(r.perujukClean || r.perujuk || r.referrer_name || 'Perujuk Tidak Tercatat').trim(),
+        referrer_type: String((r.kategoriPerujuk === 'Internal' || r.tipePerujuk === 'internal' || r.referrer_type === 'internal') ? 'internal' : 'eksternal'),
+        referrer_address: String(r.alamatPerujukRaw || r.alamatPerujuk || r.referrer_address || '').trim(),
+        target_poli: String(r.poliTujuan || r.poli || r.target_poli || '').trim(),
+        diagnosis: String(r.diagnosaAwal || r.diagnosa || r.diagnosis || '').trim(),
+        payment_method: String(r.kategoriPembayaran || r.caraBayar || r.payment_method || 'Umum/Tunai').trim(),
+        patient_age_group: String(r.kelompokUsia || r.kelompokUmur || r.patient_age_group || '').trim(),
+        patient_address: String(r.alamatPasienRaw || r.alamatPasien || r.patient_address || '').trim(),
+        created_at: new Date().toISOString(),
+      });
+    }
+
+    // Process in safe chunks of 100 for safety and speed
+    const CHUNK_SIZE = 100;
     let syncedTotal = 0;
 
     for (let i = 0; i < safeRecords.length; i += CHUNK_SIZE) {
@@ -481,10 +583,15 @@ app.post('/api/supabase/sync-referrals', async (req, res) => {
         .upsert(chunk, { onConflict: 'id' });
 
       if (error) {
-        console.error('Supabase referral upsert error:', error);
-        return res.status(500).json({
+        console.warn('Supabase referral_records sync notice:', error.message || error);
+        const isTableMissing = error.code === '42P01' || error.message?.includes('does not exist');
+        return res.json({
           success: false,
-          error: `Supabase Error pada batch ${i + 1}: ${error.message}. Pastikan skrip tabel 'referral_records' telah dijalankan di Supabase.`,
+          isTableMissing,
+          code: error.code,
+          error: isTableMissing
+            ? `Tabel 'referral_records' belum dibuat di database Supabase Anda. Buka menu 'Database & Vercel Sync' > tab 'Pensalinan Skrip SQL DDL', lalu jalankan skrip tersebut di Supabase SQL Editor.`
+            : `Supabase: ${error.message || 'Gagal menyinkronkan data rujukan ke Supabase'}.`,
         });
       }
       syncedTotal += chunk.length;
@@ -496,18 +603,18 @@ app.post('/api/supabase/sync-referrals', async (req, res) => {
       message: `Berhasil menyinkronkan total ${syncedTotal} data rujukan pasien ke Supabase.`,
     });
   } catch (error: any) {
-    console.error('Error syncing referrals to Supabase:', error);
-    res.status(500).json({ success: false, error: error.message || 'Gagal menyinkronkan data rujukan' });
+    console.warn('Supabase sync-referrals notice:', error?.message || error);
+    res.json({ success: false, error: error?.message || 'Gagal menyinkronkan data rujukan' });
   }
 });
 
 // Fetch Referral Records from Supabase
 app.get('/api/supabase/fetch-referrals', async (req, res) => {
-  const { client } = getSupabaseBackendClient();
+  const { client } = getSupabaseBackendClient(req);
   if (!client) {
-    return res.status(400).json({
+    return res.json({
       success: false,
-      error: 'Supabase belum dikonfigurasi di server.',
+      error: 'Supabase belum dikonfigurasi di server atau header kredensial kosong.',
     });
   }
 
@@ -519,7 +626,8 @@ app.get('/api/supabase/fetch-referrals', async (req, res) => {
       .limit(5000);
 
     if (error) {
-      return res.status(500).json({
+      console.warn('Supabase fetch-referrals notice:', error.message || error);
+      return res.json({
         success: false,
         error: `Gagal membaca rujukan: ${error.message}`,
       });
@@ -546,41 +654,43 @@ app.get('/api/supabase/fetch-referrals', async (req, res) => {
       count: records.length,
     });
   } catch (error: any) {
-    console.error('Error fetching referrals from Supabase:', error);
-    res.status(500).json({ success: false, error: error.message || 'Gagal memuat rujukan dari Supabase' });
+    console.warn('Supabase fetch-referrals notice:', error?.message || error);
+    res.json({ success: false, error: error?.message || 'Gagal memuat rujukan dari Supabase' });
   }
 });
 
 // Save Welcome Screen Configuration
 app.post('/api/supabase/save-welcome-config', async (req, res) => {
-  const { client } = getSupabaseBackendClient();
+  const { client } = getSupabaseBackendClient(req);
   if (!client) {
-    return res.status(400).json({ success: false, error: 'Supabase belum dikonfigurasi di server.' });
+    return res.json({ success: false, error: 'Supabase belum dikonfigurasi di server.' });
   }
 
   try {
     const { config } = req.body;
-    if (!config) return res.status(400).json({ success: false, error: 'Konfigurasi tidak valid.' });
+    if (!config) return res.json({ success: false, error: 'Konfigurasi tidak valid.' });
 
     const { error } = await client
       .from('app_settings')
       .upsert({ key: 'welcome_config', value: config, updated_at: new Date().toISOString() }, { onConflict: 'key' });
 
     if (error) {
-      return res.status(500).json({ success: false, error: error.message });
+      console.warn('Supabase save-welcome-config notice:', error.message || error);
+      return res.json({ success: false, error: error.message });
     }
 
     res.json({ success: true, message: 'Konfigurasi Welcome Screen berhasil disimpan ke Supabase cloud.' });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    console.warn('Supabase save-welcome-config notice:', err?.message || err);
+    res.json({ success: false, error: err?.message || 'Gagal menyimpan konfigurasi' });
   }
 });
 
 // Get Welcome Screen Configuration
 app.get('/api/supabase/get-welcome-config', async (req, res) => {
-  const { client } = getSupabaseBackendClient();
+  const { client } = getSupabaseBackendClient(req);
   if (!client) {
-    return res.status(400).json({ success: false, error: 'Supabase belum dikonfigurasi di server.' });
+    return res.json({ success: false, config: null });
   }
 
   try {

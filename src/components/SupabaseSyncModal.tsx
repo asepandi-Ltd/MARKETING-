@@ -26,6 +26,37 @@ import {
 } from '../utils/supabaseClient';
 import { saveRecordsToIndexedDB } from '../utils/indexedDbStorage';
 
+function cleanIsoDate(val: any): string | null {
+  if (!val) return null;
+  if (typeof val !== 'string') return null;
+  const trimmed = val.trim();
+  if (!trimmed || trimmed === 'Invalid Date') return null;
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return trimmed;
+  }
+
+  if (trimmed.includes('T')) {
+    const part = trimmed.split('T')[0];
+    if (/^\d{4}-\d{2}-\d{2}$/.test(part)) return part;
+  }
+
+  if (/^\d{1,2}[\/-]\d{1,2}[\/-]\d{4}$/.test(trimmed)) {
+    const parts = trimmed.split(/[\/-]/);
+    const day = parts[0].padStart(2, '0');
+    const month = parts[1].padStart(2, '0');
+    const year = parts[2];
+    return `${year}-${month}-${day}`;
+  }
+
+  const parsed = new Date(trimmed);
+  if (!isNaN(parsed.getTime())) {
+    return parsed.toISOString().split('T')[0];
+  }
+
+  return null;
+}
+
 interface SupabaseSyncModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -225,14 +256,20 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
     setSyncingVisits(true);
     setFeedback(null);
 
+    const { url: sUrl, key: sKey } = getStoredSupabaseCredentials();
+
     try {
       const res = await fetch('/api/supabase/sync-visits', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'x-supabase-url': sUrl || '',
+          'x-supabase-key': sKey || '',
+        },
         body: JSON.stringify({ visits }),
       });
       const data = await res.json();
-      if (res.ok && data.success) {
+      if (data && data.success) {
         setFeedback({ 
           type: 'success', 
           message: data.message || `Berhasil menyinkronkan ${visits.length} data kunjungan ke Supabase!` 
@@ -241,33 +278,61 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
       } else {
         const client = getSupabaseClient();
         if (client) {
-          const rows = visits.map((v, i) => ({
-            id: v.id || `visit-${Date.now()}-${i}`,
-            visit_date: v.tanggalKunjungan,
-            target_location: v.lokasiTujuan,
-            segment_type: v.jenisSegmen,
-            address: v.alamat || '',
-            purpose: v.maksudKunjungan || '',
-            notes: v.catatanHasil || '',
-            updated_at: new Date().toISOString(),
-          }));
+          const seenIds = new Set<string>();
+          const rows: any[] = [];
+          for (let i = 0; i < visits.length; i++) {
+            const v = visits[i];
+            let rowId = v.id ? String(v.id).trim() : '';
+            if (!rowId || seenIds.has(rowId)) {
+              rowId = `visit-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`;
+            }
+            seenIds.add(rowId);
 
-          const { error } = await client.from('marketing_visits').upsert(rows, { onConflict: 'id' });
-          if (!error) {
+            rows.push({
+              id: rowId,
+              visit_date: cleanIsoDate(v.tanggalKunjungan),
+              target_location: String(v.lokasiTujuan || 'Lokasi Kunjungan').trim(),
+              segment_type: String(v.jenisSegmen || 'Lainnya').trim(),
+              address: String(v.alamat || '').trim(),
+              purpose: String(v.maksudKunjungan || '').trim(),
+              notes: String(v.catatanHasil || '').trim(),
+              updated_at: new Date().toISOString(),
+            });
+          }
+
+          let directSuccess = true;
+          let count = 0;
+          const CHUNK = 100;
+          for (let i = 0; i < rows.length; i += CHUNK) {
+            const chunk = rows.slice(i, i + CHUNK);
+            const { error } = await client.from('marketing_visits').upsert(chunk, { onConflict: 'id' });
+            if (error) {
+              directSuccess = false;
+              const isMissing = error.code === '42P01' || error.message?.includes('does not exist');
+              setFeedback({ 
+                type: 'error', 
+                message: isMissing 
+                  ? "Tabel 'marketing_visits' belum dibuat di Supabase. Salin dan jalankan skrip di tab 'Pensalinan Skrip SQL DDL'." 
+                  : `Supabase: ${error.message}` 
+              });
+              break;
+            }
+            count += chunk.length;
+          }
+
+          if (directSuccess) {
             setFeedback({
               type: 'success',
-              message: `Berhasil menyinkronkan ${visits.length} data kunjungan secara langsung via Supabase Client!`,
+              message: `Berhasil menyinkronkan ${count} data kunjungan langsung via Supabase Client!`,
             });
             fetchStatus();
-          } else {
-            setFeedback({ type: 'error', message: `Supabase Error: ${error.message}` });
           }
         } else {
-          setFeedback({ type: 'error', message: data.error || 'Gagal menyinkronkan data kunjungan ke Supabase.' });
+          setFeedback({ type: 'error', message: data?.error || 'Gagal menyinkronkan data kunjungan ke Supabase.' });
         }
       }
     } catch (err: any) {
-      setFeedback({ type: 'error', message: err.message || 'Koneksi gagal saat menyinkronkan kunjungan.' });
+      setFeedback({ type: 'error', message: err?.message || 'Koneksi gagal saat menyinkronkan kunjungan.' });
     } finally {
       setSyncingVisits(false);
     }
@@ -277,10 +342,17 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
   const handleFetchVisits = async () => {
     setFetchingVisits(true);
     setFeedback(null);
+    const { url: sUrl, key: sKey } = getStoredSupabaseCredentials();
+
     try {
-      const res = await fetch('/api/supabase/fetch-visits');
+      const res = await fetch('/api/supabase/fetch-visits', {
+        headers: {
+          'x-supabase-url': sUrl || '',
+          'x-supabase-key': sKey || '',
+        },
+      });
       const data = await res.json();
-      if (res.ok && data.success && data.visits && data.visits.length > 0) {
+      if (data && data.success && data.visits && data.visits.length > 0) {
         const mappedVisits: MarketingVisitRecord[] = data.visits.map((v: any) => ({
           id: v.id,
           tanggalKunjungan: v.visitDate || v.tanggalKunjungan,
@@ -333,7 +405,7 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
         }
       }
     } catch (err: any) {
-      setFeedback({ type: 'error', message: err.message || 'Koneksi gagal saat membaca data kunjungan.' });
+      setFeedback({ type: 'error', message: err?.message || 'Koneksi gagal saat membaca data kunjungan.' });
     } finally {
       setFetchingVisits(false);
     }
@@ -348,14 +420,20 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
     setSyncingReferrals(true);
     setFeedback(null);
 
+    const { url: sUrl, key: sKey } = getStoredSupabaseCredentials();
+
     try {
       const res = await fetch('/api/supabase/sync-referrals', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'x-supabase-url': sUrl || '',
+          'x-supabase-key': sKey || '',
+        },
         body: JSON.stringify({ records: referrals }),
       });
       const data = await res.json();
-      if (res.ok && data.success) {
+      if (data && data.success) {
         setFeedback({
           type: 'success',
           message: data.message || `Berhasil menyinkronkan rujukan ke Supabase!`,
@@ -364,45 +442,67 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
       } else {
         const client = getSupabaseClient();
         if (client) {
-          const rows = referrals.map((r, idx) => ({
-            id: r.id || `ref-${Date.now()}-${idx}`,
-            entry_date: r.tanggalMasuk || null,
-            referrer_name: r.perujukClean || r.perujukRaw || 'Perujuk Tidak Tercatat',
-            referrer_type: r.kategoriPerujuk === 'Internal' ? 'internal' : 'eksternal',
-            referrer_address: r.alamatPerujukRaw || '',
-            target_poli: r.poliTujuan || '',
-            diagnosis: r.diagnosaAwal || '',
-            payment_method: r.kategoriPembayaran || 'Umum/Tunai',
-            patient_age_group: r.kelompokUsia || '',
-            patient_address: r.alamatPasienRaw || r.wilayahPasienNormal || '',
-            created_at: new Date().toISOString(),
-          }));
+          const seenIds = new Set<string>();
+          const rows: any[] = [];
+          for (let idx = 0; idx < referrals.length; idx++) {
+            const r = referrals[idx];
+            let rowId = r.id ? String(r.id).trim() : '';
+            if (!rowId || seenIds.has(rowId)) {
+              rowId = `ref-${Date.now()}-${idx}-${Math.random().toString(36).substring(2, 6)}`;
+            }
+            seenIds.add(rowId);
 
-          const CHUNK = 500;
+            rows.push({
+              id: rowId,
+              entry_date: cleanIsoDate(r.tanggalMasuk),
+              referrer_name: String(r.perujukClean || r.perujukRaw || 'Perujuk Tidak Tercatat').trim(),
+              referrer_type: String(r.kategoriPerujuk === 'Internal' ? 'internal' : 'eksternal'),
+              referrer_address: String(r.alamatPerujukRaw || '').trim(),
+              target_poli: String(r.poliTujuan || '').trim(),
+              diagnosis: String(r.diagnosaAwal || '').trim(),
+              payment_method: String(r.kategoriPembayaran || 'Umum/Tunai').trim(),
+              patient_age_group: String(r.kelompokUsia || '').trim(),
+              patient_address: String(r.alamatPasienRaw || r.wilayahPasienNormal || '').trim(),
+              created_at: new Date().toISOString(),
+            });
+          }
+
+          let directSuccess = true;
+          const CHUNK = 100;
           let count = 0;
           for (let i = 0; i < rows.length; i += CHUNK) {
             const chunk = rows.slice(i, i + CHUNK);
             const { error } = await client.from('referral_records').upsert(chunk, { onConflict: 'id' });
             if (error) {
-              throw new Error(error.message);
+              directSuccess = false;
+              const isMissing = error.code === '42P01' || error.message?.includes('does not exist');
+              setFeedback({ 
+                type: 'error', 
+                message: isMissing 
+                  ? "Tabel 'referral_records' belum dibuat di Supabase. Salin dan jalankan skrip di tab 'Pensalinan Skrip SQL DDL'." 
+                  : `Supabase: ${error.message}` 
+              });
+              break;
             }
             count += chunk.length;
           }
 
-          setFeedback({
-            type: 'success',
-            message: `Berhasil menyinkronkan ${count} data rujukan via Supabase Client!`,
-          });
-          fetchStatus();
+          if (directSuccess) {
+            setFeedback({
+              type: 'success',
+              message: `Berhasil menyinkronkan ${count} data rujukan via Supabase Client!`,
+            });
+            fetchStatus();
+          }
         } else {
           setFeedback({
             type: 'error',
-            message: data.error || 'Gagal menyinkronkan data rujukan ke Supabase.',
+            message: data?.error || 'Gagal menyinkronkan data rujukan ke Supabase.',
           });
         }
       }
     } catch (err: any) {
-      setFeedback({ type: 'error', message: err.message || 'Koneksi gagal saat menyinkronkan rujukan.' });
+      setFeedback({ type: 'error', message: err?.message || 'Koneksi gagal saat menyinkronkan rujukan.' });
     } finally {
       setSyncingReferrals(false);
     }
@@ -412,8 +512,14 @@ GEMINI_API_KEY="${import.meta.env.VITE_GEMINI_API_KEY || ''}"
   const handleFetchReferrals = async () => {
     setFetchingReferrals(true);
     setFeedback(null);
+    const { url: sUrl, key: sKey } = getStoredSupabaseCredentials();
     try {
-      const res = await fetch('/api/supabase/fetch-referrals');
+      const res = await fetch('/api/supabase/fetch-referrals', {
+        headers: {
+          'x-supabase-url': sUrl || '',
+          'x-supabase-key': sKey || '',
+        },
+      });
       const data = await res.json();
       if (res.ok && data.success && data.records && data.records.length > 0) {
         if (onReferralsLoaded) onReferralsLoaded(data.records);
